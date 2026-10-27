@@ -1,8 +1,8 @@
-"""Coordinator behaviour: command failures, observation lifecycle, fresh status at setup."""
+"""Coordinator behaviour: command failures, observation lifecycle, liveness, status at setup."""
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, create_autospec, patch
+from unittest.mock import AsyncMock, Mock, create_autospec, patch
 
 import pytest
 from aioairctrl import CoAPClient
@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.philips_airpurifier_coap import async_setup_entry
+from custom_components.philips_airpurifier_coap import async_remove_entry, async_setup_entry
 from custom_components.philips_airpurifier_coap import coordinator as coordinator_module
 from custom_components.philips_airpurifier_coap.const import CONF_DEVICE_ID, CONF_MODEL, CONF_STATUS, DOMAIN
 from custom_components.philips_airpurifier_coap.coordinator import CommandFailed, Coordinator
@@ -33,6 +33,8 @@ def fake_client(set_result=True):
     client = create_autospec(CoAPClient, instance=True)
     client.set_control_values.return_value = set_result
     client.get_status.return_value = ({"D03102": 1}, 60)
+    client.ping.return_value = True
+    client.observing = True
     stopped = asyncio.Event()
 
     async def shutdown():
@@ -55,7 +57,6 @@ async def coordinator(hass: HomeAssistant):
 
 
 async def test_command_passes_confirm_through(coordinator: Coordinator) -> None:
-    coordinator._observing.set()
     await coordinator.async_set_control_values({"D0310C": 0}, confirm=True)
     coordinator.client.set_control_values.assert_awaited_once_with(data={"D0310C": 0}, confirm=True)
 
@@ -75,6 +76,7 @@ async def test_failed_command_raises_and_reconnects(coordinator: Coordinator, ou
 
 
 async def test_confirmed_command_fails_without_an_observation(coordinator: Coordinator) -> None:
+    coordinator.client.observing = False
     with (
         patch.object(coordinator_module, "READY_TIMEOUT", 0.01),
         patch.object(coordinator, "reconnect", AsyncMock()) as reconnect,
@@ -121,33 +123,86 @@ async def test_failure_during_a_reconnect_does_not_restart_it(coordinator: Coord
 
 
 @pytest.mark.parametrize("failure", [None, ValueError("bad payload")])
-async def test_long_observation_that_ends_reconnects(coordinator: Coordinator, failure) -> None:
+async def test_an_ended_observation_is_left_to_the_liveness_check(coordinator: Coordinator, failure) -> None:
+    """Reconnecting from the observation itself would hammer a device that ends them."""
+
     async def observe_status():
         yield {"D03102": 0}
         if failure:
             raise failure
 
     coordinator.client.observe_status = observe_status
-    with (
-        patch.object(coordinator_module, "MIN_OBSERVATION_SECONDS", 0),
-        patch.object(coordinator, "reconnect", AsyncMock()) as reconnect,
-    ):
+    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
         await coordinator._async_observe_status()
     assert coordinator.status == {"D03102": 0}
-    assert not coordinator._observing.is_set()
+    reconnect.assert_not_called()
+
+
+async def test_liveness_reconnects_an_ended_observation(coordinator: Coordinator) -> None:
+    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
+        await coordinator._keep_observing()
     reconnect.assert_awaited_once()
 
 
-async def test_short_observation_is_left_to_the_watchdog(coordinator: Coordinator) -> None:
-    """A device that refuses observations must not be reconnected in a loop."""
-
-    async def observe_status():
-        yield {"D03102": 0}
-
-    coordinator.client.observe_status = observe_status
+async def test_liveness_renews_a_silent_observation_on_the_same_client(coordinator: Coordinator) -> None:
+    coordinator._start_observing()
+    observing = coordinator._task
+    coordinator._last_notified -= coordinator_module.OBSERVE_REFRESH + 1
     with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
-        await coordinator._async_observe_status()
+        await coordinator._keep_observing()
     reconnect.assert_not_called()
+    assert coordinator._task is not observing
+    await asyncio.sleep(0)
+    assert observing is not None
+    assert observing.cancelled()
+
+
+async def test_liveness_leaves_a_quiet_observation_alone(coordinator: Coordinator) -> None:
+    coordinator._start_observing()
+    observing = coordinator._task
+    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
+        await coordinator._keep_observing()
+    reconnect.assert_not_called()
+    assert coordinator._task is observing
+
+
+async def run_liveness(coordinator: Coordinator, pings: list[bool]) -> list[bool]:
+    """Run the liveness loop over the scripted pings; return its reachability changes."""
+    assert coordinator._liveness_task is not None
+    coordinator._liveness_task.cancel()
+    seen: list[bool] = []
+    answered = asyncio.Event()
+    script = iter(pings)
+
+    async def ping():
+        try:
+            return next(script)
+        except StopIteration:
+            answered.set()
+            await asyncio.Event().wait()
+
+    coordinator.client.ping.side_effect = ping
+
+    def record() -> None:
+        if coordinator.reachable != (seen[-1] if seen else True):
+            seen.append(coordinator.reachable)
+
+    coordinator._listeners.append(record)
+    with patch.object(coordinator_module, "PING_INTERVAL", 0):
+        task = asyncio.create_task(coordinator._liveness())
+        await asyncio.wait_for(answered.wait(), 1)
+        task.cancel()
+    return seen
+
+
+async def test_a_device_missing_pings_is_unavailable_until_it_answers(coordinator: Coordinator) -> None:
+    coordinator._start_observing()
+    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
+        seen = await run_liveness(coordinator, [False, True, False, False, False, False, True])
+    # Two misses in a row are tolerated; the third makes it unreachable, once.
+    assert seen == [False, True]
+    assert coordinator.reachable
+    reconnect.assert_awaited_once()
 
 
 async def test_reconnect_stops_observing_before_shutdown(coordinator: Coordinator) -> None:
@@ -160,7 +215,6 @@ async def test_reconnect_stops_observing_before_shutdown(coordinator: Coordinato
 
     new_client = fake_client()
     with (
-        patch.object(coordinator_module, "MIN_OBSERVATION_SECONDS", 0),
         patch(CREATE, AsyncMock(return_value=new_client)),
         patch.object(coordinator, "reconnect", wraps=coordinator.reconnect) as reconnect,
     ):
@@ -247,7 +301,7 @@ async def test_failed_preset_is_not_shown() -> None:
 
 async def test_sensor_without_its_key_is_unavailable() -> None:
     sensor = object.__new__(PhilipsSensor)
-    sensor.coordinator = SimpleNamespace(status={"D03102": 1})  # type: ignore[assignment]
+    sensor.coordinator = SimpleNamespace(status={"D03102": 1}, reachable=True)  # type: ignore[assignment]
     sensor.kind = "D03221"
     assert not sensor.available
     sensor.coordinator.status["D03221"] = 3
@@ -257,7 +311,7 @@ async def test_sensor_without_its_key_is_unavailable() -> None:
 async def test_sensor_without_its_key_keeps_its_default_icon() -> None:
     """HA reads the icon of an unavailable entity too."""
     sensor = object.__new__(PhilipsSensor)
-    sensor.coordinator = SimpleNamespace(status={"D03102": 1})  # type: ignore[assignment]
+    sensor.coordinator = SimpleNamespace(status={"D03102": 1}, reachable=True)  # type: ignore[assignment]
     sensor.kind = "D03221"
     sensor._icon_map = {0: "mdi:low", 10: "mdi:high"}
     sensor._norm_icon = "mdi:low"
@@ -280,13 +334,34 @@ async def test_a_failing_entity_does_not_end_the_observation(coordinator: Coordi
     assert seen == [{"D03102": 0}, {"D03102": 1}]
 
 
-async def test_watchdog_leaves_a_command_in_flight_alone(coordinator: Coordinator) -> None:
+async def test_liveness_leaves_a_command_in_flight_alone(coordinator: Coordinator) -> None:
     with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
         async with coordinator._command_lock:
-            await coordinator._watchdog()
+            await run_liveness(coordinator, [True])
         reconnect.assert_not_called()
-        await coordinator._watchdog()
+        await run_liveness(coordinator, [True])
     reconnect.assert_awaited_once()
+
+
+async def test_a_notified_status_is_saved(coordinator: Coordinator) -> None:
+    store = Mock()
+    coordinator._store = store
+
+    async def observe_status():
+        yield {"D03102": 0}
+
+    coordinator.client.observe_status = observe_status
+    await coordinator._async_observe_status()
+    store.async_delay_save.assert_called_once()
+    assert store.async_delay_save.call_args.args[0]() == {"D03102": 0}
+
+
+async def test_an_unreachable_device_is_unavailable() -> None:
+    fan = object.__new__(PhilipsGenericFanBase)
+    fan.coordinator = SimpleNamespace(status={"D03102": 1}, reachable=False)  # type: ignore[assignment]
+    assert not fan.available
+    fan.coordinator.reachable = True
+    assert fan.available
 
 
 async def test_a_stalled_command_fails_within_the_command_timeout(coordinator: Coordinator) -> None:
@@ -324,15 +399,31 @@ async def setup(hass: HomeAssistant, entry: MockConfigEntry, client) -> None:
         assert await async_setup_entry(hass, entry)
 
 
-async def test_setup_shows_the_live_status_and_keeps_stored_keys(hass: HomeAssistant) -> None:
+async def test_setup_starts_from_the_stored_status_without_asking_the_device(hass: HomeAssistant) -> None:
+    """The device answers a status request only once its status changes."""
     entry = add_entry(hass, {CONF_STATUS: {"D03102": 1, "D0310C": 0, "D03221": 3}})
     client = fake_client()
-    client.get_status.return_value = ({"D03102": 0, "D0310C": 17}, 60)
     await setup(hass, entry, client)
     data = hass.data[DOMAIN][entry.entry_id]
     try:
+        client.get_status.assert_not_called()
+        assert data.coordinator.status == {"D03102": 1, "D0310C": 0, "D03221": 3}
+    finally:
+        await data.coordinator.shutdown()
+
+
+async def test_setup_starts_from_the_saved_status_and_keeps_stored_keys(hass: HomeAssistant, hass_storage) -> None:
+    entry = add_entry(hass, {CONF_STATUS: {"D03102": 1, "D0310C": 0, "D03221": 3}})
+    hass_storage[f"{DOMAIN}.{entry.entry_id}.status"] = {
+        "version": 1,
+        "key": f"{DOMAIN}.{entry.entry_id}.status",
+        "data": {"D03102": 0, "D0310C": 17},
+    }
+    await setup(hass, entry, fake_client())
+    data = hass.data[DOMAIN][entry.entry_id]
+    try:
         assert data.coordinator.status == {"D03102": 0, "D0310C": 17}
-        # live values, plus the stored key the device omitted, so its entity still exists
+        # saved values, plus the stored key the device omitted, so its entity still exists
         assert data.latest_status == {"D03102": 0, "D0310C": 17, "D03221": 3}
         assert entry.data[CONF_STATUS] == {"D03102": 1, "D0310C": 0, "D03221": 3}
     finally:
@@ -349,8 +440,8 @@ async def test_setup_stores_the_status_of_an_old_entry(hass: HomeAssistant) -> N
         await data.coordinator.shutdown()
 
 
-async def test_setup_without_a_live_status_is_retried(hass: HomeAssistant) -> None:
-    entry = add_entry(hass, {CONF_STATUS: {"D03102": 1}})
+async def test_setup_of_an_old_entry_without_a_status_is_retried(hass: HomeAssistant) -> None:
+    entry = add_entry(hass, {})
     client = fake_client()
     client.get_status.side_effect = TimeoutError("no reply")
     with (
@@ -365,7 +456,9 @@ async def test_setup_without_a_live_status_is_retried(hass: HomeAssistant) -> No
     client.shutdown.assert_awaited_once()
 
 
-async def test_tiny_max_age_keeps_the_watchdog_period(coordinator: Coordinator) -> None:
-    coordinator.client.get_status.return_value = ({"D03102": 1}, 0)
-    await coordinator.async_first_refresh()
-    assert coordinator._timeout == coordinator_module.MIN_TIMEOUT
+async def test_removing_an_entry_deletes_its_saved_status(hass: HomeAssistant, hass_storage) -> None:
+    entry = add_entry(hass, {CONF_STATUS: {"D03102": 1}})
+    key = f"{DOMAIN}.{entry.entry_id}.status"
+    hass_storage[key] = {"version": 1, "key": key, "data": {"D03102": 0}}
+    await async_remove_entry(hass, entry)
+    assert key not in hass_storage

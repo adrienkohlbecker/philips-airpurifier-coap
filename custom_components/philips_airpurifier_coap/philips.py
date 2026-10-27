@@ -78,8 +78,8 @@ class PhilipsEntity(Entity):
 
     @property
     def available(self):
-        """Return if the device is available."""
-        return self.coordinator.status is not None
+        """Return if the device answers, with a status to show."""
+        return self.coordinator.reachable and self.coordinator.status is not None
 
     @property
     def _device_status(self) -> dict[str, Any]:

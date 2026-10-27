@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.http import HomeAssistantView
+from homeassistant.helpers.storage import Store
 
 from .config_entry_data import ConfigEntryData
 from .const import (
@@ -154,19 +155,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     device_information = DeviceInformation(host=host, mac=mac, model=model, name=name, device_id=device_id)
 
-    # The status stored in the entry dates from its creation, so presenting it
-    # as live would misreport the device until its first notification, which
-    # can take hours on firmware that notifies only on change.
-    coordinator = Coordinator(hass, client, host, None)
-    try:
-        await coordinator.async_first_refresh()
-    except ConfigEntryNotReady:
-        await coordinator.shutdown()
-        raise
-    status = coordinator.status
-
-    # old entries have no status data
-    if CONF_STATUS not in entry.data:
+    # The device answers a status request only once its status changes, which
+    # can take hours, so the entities start from the last notified status,
+    # saved for this, or else the status stored when the entry was created.
+    store = _status_store(hass, entry)
+    status = await store.async_load() or entry.data.get(CONF_STATUS)
+    coordinator = Coordinator(hass, client, host, status, store)
+    if status is None:
+        # old entries have no status data
+        try:
+            await coordinator.async_first_refresh()
+        except ConfigEntryNotReady:
+            await coordinator.shutdown()
+            raise
+        status = coordinator.status
         hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_STATUS: status})
 
     # Entities are created for the keys in latest_status. A device can omit
@@ -188,6 +190,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     return True
+
+
+def _status_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
+    """Where the entry's last notified status is saved across restarts."""
+    return Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.status")
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the entry's saved status."""
+    await _status_store(hass, entry).async_remove()
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
