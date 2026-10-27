@@ -290,5 +290,13 @@
         "name": "Target temperature"
       }
     }
+  },
+  "exceptions": {
+    "command_failed": {
+      "message": "{host} did not apply {command}"
+    },
+    "first_refresh_failed": {
+      "message": "{host} did not report its status: {error}"
+    }
   }
 }

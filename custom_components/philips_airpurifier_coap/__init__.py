@@ -169,11 +169,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if CONF_STATUS not in entry.data:
         hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_STATUS: status})
 
+    # Entities are created for the keys in latest_status. A device can omit
+    # keys depending on its state, so the stored keys keep the entity set
+    # stable across restarts; entities read their values from the live status.
+    latest_status = {**entry.data[CONF_STATUS], **status}
+
     # store the data in the hass.data
     config_entry_data = ConfigEntryData(
         device_information=device_information,
         coordinator=coordinator,
-        latest_status=status,
+        latest_status=latest_status,
         client=client,
     )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = config_entry_data

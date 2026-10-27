@@ -181,6 +181,12 @@ class PhilipsGenericControlBase(PhilipsEntity):
 class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
     """Class as basis to manage a generic Philips fan."""
 
+    # Confirm power, preset and speed commands against the device's next status
+    # notification, resending once (see Coordinator.async_set_control_values).
+    # Only for models whose status reports exactly the values these patterns
+    # send; on others a confirmation would time out and fail the command.
+    CONFIRM_COMMANDS: ClassVar[bool] = False
+
     CREATE_FAN = True
 
     AVAILABLE_SPEEDS: ClassVar = {}
@@ -257,14 +263,18 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
             await self.async_set_percentage(percentage)
             return
 
-        await self.coordinator.async_set_control_value(self.KEY_PHILIPS_POWER, self.STATE_POWER_ON, confirm=True)
+        await self.coordinator.async_set_control_value(
+            self.KEY_PHILIPS_POWER, self.STATE_POWER_ON, confirm=self.CONFIRM_COMMANDS
+        )
 
         self._device_status[self.KEY_PHILIPS_POWER] = self.STATE_POWER_ON
         self._handle_coordinator_update()
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the fan off."""
-        await self.coordinator.async_set_control_value(self.KEY_PHILIPS_POWER, self.STATE_POWER_OFF, confirm=True)
+        await self.coordinator.async_set_control_value(
+            self.KEY_PHILIPS_POWER, self.STATE_POWER_OFF, confirm=self.CONFIRM_COMMANDS
+        )
 
         self._device_status[self.KEY_PHILIPS_POWER] = self.STATE_POWER_OFF
         self._handle_coordinator_update()
@@ -299,7 +309,7 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
 
         status_pattern = self._available_preset_modes.get(preset_mode)
         if status_pattern:
-            await self.coordinator.async_set_control_values(status_pattern, confirm=True)
+            await self.coordinator.async_set_control_values(status_pattern, confirm=self.CONFIRM_COMMANDS)
             self._device_status.update(status_pattern)
             self._handle_coordinator_update()
 
@@ -337,9 +347,9 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
         off = values.get(SWITCH_OFF)
 
         if oscillating:
-            await self.coordinator.async_set_control_value(key, on, confirm=True)
+            await self.coordinator.async_set_control_value(key, on)
         else:
-            await self.coordinator.async_set_control_value(key, off, confirm=True)
+            await self.coordinator.async_set_control_value(key, off)
 
         self._device_status[key] = on if oscillating else off
         self._handle_coordinator_update()
@@ -369,7 +379,7 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
             speed = percentage_to_ordered_list_item(self._speeds, percentage)
             status_pattern = self._available_speeds.get(speed)
             if status_pattern:
-                await self.coordinator.async_set_control_values(status_pattern, confirm=True)
+                await self.coordinator.async_set_control_values(status_pattern, confirm=self.CONFIRM_COMMANDS)
                 self._device_status.update(status_pattern)
                 self._handle_coordinator_update()
 
@@ -525,6 +535,9 @@ class PhilipsAC085011(PhilipsNewGenericFan):
 
 class PhilipsAC085011C(PhilipsNew2GenericFan):
     """AC0850/11 with firmware AWS_Philips_AIR_Combo."""
+
+    # This firmware sometimes accepts a preset command and keeps its old mode.
+    CONFIRM_COMMANDS: ClassVar[bool] = True
 
     AVAILABLE_PRESET_MODES: ClassVar = {
         PresetMode.AUTO: {
@@ -1621,6 +1634,9 @@ class PhilipsAC4221(PhilipsAC4220):
 
 class PhilipsAC4236(PhilipsGenericFan):
     """AC4236."""
+
+    # Seen accepting a preset command and keeping its old mode.
+    CONFIRM_COMMANDS: ClassVar[bool] = True
 
     AVAILABLE_PRESET_MODES: ClassVar = {
         PresetMode.AUTO: {PhilipsApi.POWER: "1", PhilipsApi.MODE: "AG"},
