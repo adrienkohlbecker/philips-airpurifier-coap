@@ -21,6 +21,7 @@ from custom_components.philips_airpurifier_coap.philips import (
     PhilipsAC4236,
     PhilipsGenericFanBase,
 )
+from custom_components.philips_airpurifier_coap.sensor import PhilipsSensor
 
 HOST = "192.0.2.1"
 CREATE = "custom_components.philips_airpurifier_coap.coordinator.CoAPClient.create"
@@ -198,35 +199,98 @@ async def test_nothing_reconnects_after_shutdown(hass: HomeAssistant) -> None:
     assert coordinator._reconnect_task is None
 
 
+def fan_of(fan_class, status: dict, set_control_values: AsyncMock):
+    """A fan entity of fan_class on a coordinator stub holding status."""
+    fan = object.__new__(fan_class)
+    fan.coordinator = SimpleNamespace(status=status, async_set_control_values=set_control_values)  # type: ignore[assignment]
+    fan._available_preset_modes = {"auto": {"D03102": 1, "D0310C": 0}}
+    fan._handle_coordinator_update = lambda: None  # type: ignore[method-assign]
+    return fan
+
+
 @pytest.mark.parametrize(
     ("fan_class", "confirm"),
     [(PhilipsAC085011C, True), (PhilipsAC4236, True), (PhilipsGenericFanBase, False)],
 )
 async def test_fan_preset_confirms_only_on_opted_in_models(fan_class, confirm) -> None:
-    coordinator = SimpleNamespace(async_set_control_values=AsyncMock())
-    fan = SimpleNamespace(
-        coordinator=coordinator,
-        CONFIRM_COMMANDS=fan_class.CONFIRM_COMMANDS,
-        _available_preset_modes={"auto": {"D03102": 1, "D0310C": 0}},
-        _device_status={"D0310C": 17},
-        _handle_coordinator_update=lambda: None,
-    )
-    await PhilipsGenericFanBase.async_set_preset_mode(fan, "auto")  # type: ignore[arg-type]
-    coordinator.async_set_control_values.assert_awaited_once_with({"D03102": 1, "D0310C": 0}, confirm=confirm)
+    send = AsyncMock()
+    fan = fan_of(fan_class, {"D03102": 1, "D0310C": 17}, send)
+    await fan.async_set_preset_mode("auto")
+    send.assert_awaited_once_with({"D03102": 1, "D0310C": 0}, confirm=confirm)
 
 
-async def test_failed_preset_is_not_written_optimistically() -> None:
-    coordinator = SimpleNamespace(async_set_control_values=AsyncMock(side_effect=CommandFailed(HOST, {})))
-    fan = SimpleNamespace(
-        coordinator=coordinator,
-        CONFIRM_COMMANDS=True,
-        _available_preset_modes={"auto": {"D03102": 1, "D0310C": 0}},
-        _device_status={"D0310C": 17},
-        _handle_coordinator_update=lambda: None,
-    )
+async def test_unconfirmed_preset_is_shown_at_once() -> None:
+    fan = fan_of(PhilipsGenericFanBase, {"D03102": 1, "D0310C": 17}, AsyncMock())
+    await fan.async_set_preset_mode("auto")
+    assert fan.coordinator.status == {"D03102": 1, "D0310C": 0}
+
+
+async def test_confirmed_preset_keeps_a_newer_report() -> None:
+    """The device reported the preset, then left it, before the command returned."""
+    status = {"D03102": 1, "D0310C": 17}
+    fan = fan_of(PhilipsAC085011C, status, AsyncMock())
+
+    async def send(data, confirm):
+        fan.coordinator.status = {"D03102": 1, "D0310C": 17}
+
+    fan.coordinator.async_set_control_values = send
+    await fan.async_set_preset_mode("auto")
+    assert fan.coordinator.status == {"D03102": 1, "D0310C": 17}
+
+
+async def test_failed_preset_is_not_shown() -> None:
+    fan = fan_of(PhilipsGenericFanBase, {"D03102": 1, "D0310C": 17}, AsyncMock(side_effect=CommandFailed(HOST, {})))
     with pytest.raises(CommandFailed):
-        await PhilipsGenericFanBase.async_set_preset_mode(fan, "auto")  # type: ignore[arg-type]
-    assert fan._device_status == {"D0310C": 17}
+        await fan.async_set_preset_mode("auto")
+    assert fan.coordinator.status == {"D03102": 1, "D0310C": 17}
+
+
+async def test_sensor_without_its_key_is_unavailable() -> None:
+    sensor = object.__new__(PhilipsSensor)
+    sensor.coordinator = SimpleNamespace(status={"D03102": 1})  # type: ignore[assignment]
+    sensor.kind = "D03221"
+    assert not sensor.available
+    sensor.coordinator.status["D03221"] = 3
+    assert sensor.available
+
+
+async def test_a_failing_entity_does_not_end_the_observation(coordinator: Coordinator) -> None:
+    seen = []
+
+    def broken():
+        raise KeyError("D03221")
+
+    async def observe_status():
+        yield {"D03102": 0}
+        yield {"D03102": 1}
+
+    coordinator._listeners = [broken, lambda: seen.append(coordinator.status)]
+    coordinator.client.observe_status = observe_status
+    await coordinator._async_observe_status()
+    assert seen == [{"D03102": 0}, {"D03102": 1}]
+
+
+async def test_watchdog_leaves_a_command_in_flight_alone(coordinator: Coordinator) -> None:
+    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
+        async with coordinator._command_lock:
+            await coordinator._watchdog()
+        reconnect.assert_not_called()
+        await coordinator._watchdog()
+    reconnect.assert_awaited_once()
+
+
+async def test_a_stalled_command_fails_within_the_command_timeout(coordinator: Coordinator) -> None:
+    async def stall(data, confirm=False):
+        await asyncio.sleep(10)
+
+    coordinator.client.set_control_values.side_effect = stall
+    with (
+        patch.object(coordinator_module, "COMMAND_TIMEOUT", 0.01),
+        patch.object(coordinator, "reconnect", AsyncMock()) as reconnect,
+        pytest.raises(CommandFailed),
+    ):
+        await asyncio.wait_for(coordinator.async_set_control_value("D03102", 0), 1)
+    reconnect.assert_awaited_once()
 
 
 def add_entry(hass: HomeAssistant, data_extra: dict) -> MockConfigEntry:

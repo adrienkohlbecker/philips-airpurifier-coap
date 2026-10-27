@@ -26,6 +26,9 @@ MIN_OBSERVATION_SECONDS = 60
 # How long a command waits for a reconnect in progress, or a confirmed command
 # for the observation that confirms it.
 READY_TIMEOUT = 20
+# How long a command may take once sent, resends and confirmation included,
+# so a deaf device fails a service call instead of stalling it for minutes.
+COMMAND_TIMEOUT = 30
 
 
 class CommandFailed(HomeAssistantError):
@@ -71,7 +74,7 @@ class Coordinator:
 
         self._timer_disconnected = Timer(
             timeout=self._timeout * MISSED_PACKAGE_COUNT,
-            callback=self.reconnect,
+            callback=self._watchdog,
             autostart=True,
         )
         self._timer_disconnected.setAutoRestart(True)
@@ -107,6 +110,15 @@ class Coordinator:
 
         except Exception:
             _LOGGER.exception("Exception on starting reconnect!")
+
+    async def _watchdog(self) -> None:
+        """Reconnect after a silence, unless a command is in flight.
+
+        A command proves the connection itself and reconnects when it fails;
+        replacing the client under it would fail it instead.
+        """
+        if not self._command_lock.locked():
+            await self._reconnect_unless_running()
 
     async def _reconnect_unless_running(self) -> None:
         """Reconnect unless a reconnect is already under way."""
@@ -196,8 +208,12 @@ class Coordinator:
                 self.status = status
                 self._observing.set()
                 self._timer_disconnected.reset()
-                for update_callback in self._listeners:
-                    update_callback()
+                for update_callback in list(self._listeners):
+                    try:
+                        update_callback()
+                    except Exception:
+                        # One broken entity must not end the observation for all.
+                        _LOGGER.exception("Updating an entity of %s failed", self.host)
         except Exception as ex:
             reason = repr(ex)
         else:
@@ -221,13 +237,14 @@ class Coordinator:
         aioairctrl's set_control_values), since some firmware accepts a
         command and keeps its old mode; the command first waits for a live
         observation to confirm it. Commands wait for a reconnect in progress
-        and run one at a time. A failure reconnects: the device stopped
-        answering, or the observation went deaf.
+        and run one at a time, within READY_TIMEOUT plus COMMAND_TIMEOUT. A
+        failure reconnects: the device stopped answering, or the observation
+        went deaf.
         """
         async with self._command_lock:
             try:
                 async with asyncio.timeout(READY_TIMEOUT):
-                    if self._reconnect_task is not None and not self._reconnect_task.done():
+                    while self._reconnect_task is not None and not self._reconnect_task.done():
                         await asyncio.shield(self._reconnect_task)
                     if confirm:
                         await self._observing.wait()
@@ -235,7 +252,8 @@ class Coordinator:
                 await self._reconnect_unless_running()
                 raise CommandFailed(self.host, data) from ex
             try:
-                applied = await self.client.set_control_values(data=data, confirm=confirm)
+                async with asyncio.timeout(COMMAND_TIMEOUT):
+                    applied = await self.client.set_control_values(data=data, confirm=confirm)
             except Exception as ex:
                 await self._reconnect_unless_running()
                 raise CommandFailed(self.host, data) from ex

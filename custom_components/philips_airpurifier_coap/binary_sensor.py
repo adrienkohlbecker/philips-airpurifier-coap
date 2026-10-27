@@ -77,6 +77,11 @@ class PhilipsBinarySensor(PhilipsEntity, BinarySensorEntity):
         self.kind = kind
 
     @property
+    def available(self) -> bool:
+        """Return if the device is available and reports this binary sensor."""
+        return super().available and self.kind in self._device_status
+
+    @property
     def is_on(self) -> bool:
         """Return the state of the binary sensor."""
         value = self._device_status[self.kind]

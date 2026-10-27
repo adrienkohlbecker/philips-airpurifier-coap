@@ -247,6 +247,16 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
         status = self._device_status.get(self.KEY_PHILIPS_POWER)
         return status == self.STATE_POWER_ON
 
+    def _show_sent(self, values: dict[str, Any]) -> None:
+        """Show the values of a command the device took.
+
+        Values of a confirmed command are already in the status the device
+        reported, and writing them again could overwrite a newer report.
+        """
+        if not self.CONFIRM_COMMANDS:
+            self._device_status.update(values)
+        self._handle_coordinator_update()
+
     async def async_turn_on(
         self,
         percentage: int | None = None,
@@ -266,18 +276,14 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
         await self.coordinator.async_set_control_value(
             self.KEY_PHILIPS_POWER, self.STATE_POWER_ON, confirm=self.CONFIRM_COMMANDS
         )
-
-        self._device_status[self.KEY_PHILIPS_POWER] = self.STATE_POWER_ON
-        self._handle_coordinator_update()
+        self._show_sent({self.KEY_PHILIPS_POWER: self.STATE_POWER_ON})
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the fan off."""
         await self.coordinator.async_set_control_value(
             self.KEY_PHILIPS_POWER, self.STATE_POWER_OFF, confirm=self.CONFIRM_COMMANDS
         )
-
-        self._device_status[self.KEY_PHILIPS_POWER] = self.STATE_POWER_OFF
-        self._handle_coordinator_update()
+        self._show_sent({self.KEY_PHILIPS_POWER: self.STATE_POWER_OFF})
 
     @property
     def preset_modes(self) -> list[str] | None:
@@ -310,8 +316,7 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
         status_pattern = self._available_preset_modes.get(preset_mode)
         if status_pattern:
             await self.coordinator.async_set_control_values(status_pattern, confirm=self.CONFIRM_COMMANDS)
-            self._device_status.update(status_pattern)
-            self._handle_coordinator_update()
+            self._show_sent(status_pattern)
 
     @property
     def speed_count(self) -> int:
@@ -380,8 +385,7 @@ class PhilipsGenericFanBase(PhilipsGenericControlBase, FanEntity):
             status_pattern = self._available_speeds.get(speed)
             if status_pattern:
                 await self.coordinator.async_set_control_values(status_pattern, confirm=self.CONFIRM_COMMANDS)
-                self._device_status.update(status_pattern)
-                self._handle_coordinator_update()
+                self._show_sent(status_pattern)
 
     @property
     def icon(self) -> str:
@@ -537,6 +541,7 @@ class PhilipsAC085011C(PhilipsNew2GenericFan):
     """AC0850/11 with firmware AWS_Philips_AIR_Combo."""
 
     # This firmware sometimes accepts a preset command and keeps its old mode.
+    # The other AC0850 models on this firmware inherit the confirmation.
     CONFIRM_COMMANDS: ClassVar[bool] = True
 
     AVAILABLE_PRESET_MODES: ClassVar = {
@@ -1635,7 +1640,8 @@ class PhilipsAC4221(PhilipsAC4220):
 class PhilipsAC4236(PhilipsGenericFan):
     """AC4236."""
 
-    # Seen accepting a preset command and keeping its old mode.
+    # Seen accepting a preset command and keeping its old mode. AC4231
+    # inherits the confirmation.
     CONFIRM_COMMANDS: ClassVar[bool] = True
 
     AVAILABLE_PRESET_MODES: ClassVar = {

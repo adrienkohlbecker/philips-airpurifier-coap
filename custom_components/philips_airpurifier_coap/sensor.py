@@ -120,6 +120,11 @@ class PhilipsSensor(PhilipsEntity, SensorEntity):
         self.kind = kind
 
     @property
+    def available(self) -> bool:
+        """Return if the device is available and reports this sensor."""
+        return super().available and self.kind in self._device_status
+
+    @property
     def native_value(self) -> StateType:
         """Return the native value of the sensor."""
         value = self._device_status[self.kind]
@@ -206,6 +211,11 @@ class PhilipsFilterSensor(PhilipsEntity, SensorEntity):
             self._attrs[FanAttributes.TOTAL] = self._total
             self._attrs[FanAttributes.TIME_REMAINING] = self._time_remaining
         return self._attrs
+
+    @property
+    def available(self) -> bool:
+        """Return if the device is available and reports this filter."""
+        return super().available and self._value_key in self._device_status
 
     @property
     def _has_total(self) -> bool:

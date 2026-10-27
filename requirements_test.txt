@@ -1,5 +1,5 @@
 pytest-homeassistant-custom-component
 pytest-timeout
 ruff
-aioairctrl==0.3.1
+aioairctrl @ git+https://github.com/adrienkohlbecker/aioairctrl@v0.3.1-ak1
 getmac>=0.9.4
