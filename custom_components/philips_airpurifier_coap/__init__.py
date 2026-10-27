@@ -154,21 +154,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     device_information = DeviceInformation(host=host, mac=mac, model=model, name=name, device_id=device_id)
 
-    # check if we have status data, it will be missing in old entries
-    if CONF_STATUS not in entry.data:
-        _LOGGER.warning("No status data found for model %s, trying to fetch it", model)
-        coordinator = Coordinator(hass, client, host, None)
+    # The status stored in the entry dates from its creation, so presenting it
+    # as live would misreport the device until its first notification, which
+    # can take hours on firmware that notifies only on change.
+    coordinator = Coordinator(hass, client, host, None)
+    try:
         await coordinator.async_first_refresh()
-        status = coordinator.status
+    except ConfigEntryNotReady:
+        await coordinator.shutdown()
+        raise
+    status = coordinator.status
 
-        # update the entry with the status data
-        new_data = {**entry.data}
-        new_data[CONF_STATUS] = status
-        hass.config_entries.async_update_entry(entry, data=new_data)
-
-    else:
-        status = entry.data[CONF_STATUS]
-        coordinator = Coordinator(hass, client, host, status)
+    # old entries have no status data
+    if CONF_STATUS not in entry.data:
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_STATUS: status})
 
     # store the data in the hass.data
     config_entry_data = ConfigEntryData(

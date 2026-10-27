@@ -9,13 +9,21 @@ from typing import Any
 
 from aioairctrl import CoAPClient
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 
 from .timer import Timer
 
 _LOGGER = logging.getLogger(__name__)
 
 MISSED_PACKAGE_COUNT = 3
+
+
+class CommandFailed(HomeAssistantError):
+    """A device did not take a command."""
+
+    def __init__(self, host: str, data: dict[str, Any]) -> None:
+        """Describe which command the device at host did not take."""
+        super().__init__(f"{host} did not apply {data}")
 
 
 class Coordinator:
@@ -51,6 +59,11 @@ class Coordinator:
     async def shutdown(self):
         """Shutdown the API connection."""
 
+        # Before the client: an observation ended by the shutdown would reconnect.
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
 
@@ -77,6 +90,11 @@ class Coordinator:
         """Reconnect to the API connection."""
 
         try:
+            # Stop observing first: an observation ended by the shutdown would
+            # otherwise start another reconnect.
+            if self._task:
+                self._task.cancel()
+                self._task = None
             with contextlib.suppress(Exception):
                 await self.client.shutdown()
             self.client = await CoAPClient.create(self.host)
@@ -87,8 +105,8 @@ class Coordinator:
             # Reconnect took to long
             pass
 
-        except Exception:
-            _LOGGER.exception("_reconnect error")
+        except Exception as ex:
+            _LOGGER.warning("Reconnecting to %s failed: %r", self.host, ex)
 
     async def async_first_refresh(self) -> None:
         """Refresh the data for the first time."""
@@ -132,13 +150,41 @@ class Coordinator:
             self._task = None
 
     async def _async_observe_status(self) -> None:
-        """Observe the status of the device."""
+        """Observe the status of the device, reconnecting once the observation ends."""
 
-        async for status in self.client.observe_status():
-            self.status = status
-            self._timer_disconnected.reset()
-            for update_callback in self._listeners:
-                update_callback()
+        try:
+            async for status in self.client.observe_status():
+                self.status = status
+                self._timer_disconnected.reset()
+                for update_callback in self._listeners:
+                    update_callback()
+        except Exception as ex:
+            _LOGGER.warning("Observing %s failed, reconnecting: %r", self.host, ex)
+        else:
+            _LOGGER.warning("Observation of %s ended, reconnecting", self.host)
+        # Without this the entities would freeze until the silence watchdog fires.
+        await self.reconnect()
+
+    async def async_set_control_value(self, key: str, value: Any, confirm: bool = False) -> None:
+        """Set one control value; see async_set_control_values."""
+        await self.async_set_control_values({key: value}, confirm=confirm)
+
+    async def async_set_control_values(self, data: dict[str, Any], confirm: bool = False) -> None:
+        """Send a command, raising HomeAssistantError unless the device took it.
+
+        With confirm, the device must also report the new values (see
+        aioairctrl's set_control_values), since some firmware accepts a
+        command and keeps its old mode. A failure also reconnects: the device
+        stopped answering, or the observation went deaf.
+        """
+        try:
+            applied = await self.client.set_control_values(data=data, confirm=confirm)
+        except Exception as ex:
+            await self.reconnect()
+            raise CommandFailed(self.host, data) from ex
+        if not applied:
+            await self.reconnect()
+            raise CommandFailed(self.host, data)
 
     def _start_observing(self) -> None:
         """Schedule state observation."""
