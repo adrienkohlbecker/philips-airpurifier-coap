@@ -140,7 +140,7 @@ class PhilipsSensor(PhilipsEntity, SensorEntity):
         # if the sensor has an icon map, use it to determine the icon
         # otherwise, we return the default icon, which might be None and then uses icon translation
         icon = self._norm_icon
-        if not self._icon_map:
+        if not self._icon_map or not self.available:
             return icon
 
         value = int(self.native_value)
@@ -244,7 +244,7 @@ class PhilipsFilterSensor(PhilipsEntity, SensorEntity):
         # if the sensor has an icon map, use it to determine the icon
         # otherwise, we return the default icon, which might be None and then uses icon translation
         icon = self._norm_icon
-        if not self._icon_map:
+        if not self._icon_map or not self.available:
             return icon
 
         value = int(self.native_value)

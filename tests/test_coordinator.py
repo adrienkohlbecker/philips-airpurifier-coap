@@ -254,6 +254,16 @@ async def test_sensor_without_its_key_is_unavailable() -> None:
     assert sensor.available
 
 
+async def test_sensor_without_its_key_keeps_its_default_icon() -> None:
+    """HA reads the icon of an unavailable entity too."""
+    sensor = object.__new__(PhilipsSensor)
+    sensor.coordinator = SimpleNamespace(status={"D03102": 1})  # type: ignore[assignment]
+    sensor.kind = "D03221"
+    sensor._icon_map = {0: "mdi:low", 10: "mdi:high"}
+    sensor._norm_icon = "mdi:low"
+    assert sensor.icon == "mdi:low"
+
+
 async def test_a_failing_entity_does_not_end_the_observation(coordinator: Coordinator) -> None:
     seen = []
 
