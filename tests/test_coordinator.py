@@ -9,11 +9,14 @@ from aioairctrl import CoAPClient
 from aiocoap.error import LibraryShutdown
 from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.philips_airpurifier_coap import async_remove_entry, async_setup_entry
 from custom_components.philips_airpurifier_coap import coordinator as coordinator_module
+from custom_components.philips_airpurifier_coap.config_flow import PhilipsAirPurifierConfigFlow
 from custom_components.philips_airpurifier_coap.const import CONF_DEVICE_ID, CONF_MODEL, CONF_STATUS, DOMAIN
 from custom_components.philips_airpurifier_coap.coordinator import CommandFailed, Coordinator
 from custom_components.philips_airpurifier_coap.philips import (
@@ -344,7 +347,7 @@ async def test_liveness_leaves_a_command_in_flight_alone(coordinator: Coordinato
 
 
 async def test_a_notified_status_is_saved(coordinator: Coordinator) -> None:
-    store = Mock()
+    store = Mock(async_save=AsyncMock())
     coordinator._store = store
 
     async def observe_status():
@@ -462,3 +465,81 @@ async def test_removing_an_entry_deletes_its_saved_status(hass: HomeAssistant, h
     hass_storage[key] = {"version": 1, "key": key, "data": {"D03102": 0}}
     await async_remove_entry(hass, entry)
     assert key not in hass_storage
+
+
+@pytest.mark.parametrize("notified", [True, False])
+async def test_shutdown_saves_a_notified_status_at_once(hass: HomeAssistant, notified) -> None:
+    store = Mock(async_save=AsyncMock())
+    coordinator = Coordinator(hass, fake_client(), HOST, {"D03102": 1}, store)
+    coordinator._notified = notified
+    await coordinator.shutdown()
+    if notified:
+        store.async_save.assert_awaited_once_with({"D03102": 1})
+    else:
+        store.async_save.assert_not_called()
+
+
+@pytest.mark.parametrize("notified", [True, False])
+async def test_a_reconnect_hands_the_notified_status_to_the_new_client(coordinator: Coordinator, notified) -> None:
+    """Without it, a command for values the device already has would wait for a notification."""
+    coordinator._notified = notified
+    new_client = fake_client()
+    with patch(CREATE, AsyncMock(return_value=new_client)):
+        await coordinator._reconnect()
+    if notified:
+        new_client.remember_status.assert_called_once_with({"D03102": 1})
+    else:
+        new_client.remember_status.assert_not_called()
+
+
+async def test_liveness_survives_a_failing_check(coordinator: Coordinator) -> None:
+    assert coordinator._liveness_task is not None
+    coordinator._liveness_task.cancel()
+    calls = 0
+    done = asyncio.Event()
+
+    async def ping():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("boom")
+        done.set()
+        await asyncio.Event().wait()
+
+    coordinator.client.ping.side_effect = ping
+    with patch.object(coordinator_module, "PING_INTERVAL", 0):
+        task = asyncio.create_task(coordinator._liveness())
+        await asyncio.wait_for(done.wait(), 1)
+        task.cancel()
+    assert calls == 2
+
+
+async def test_failed_platform_setup_shuts_the_coordinator_down(hass: HomeAssistant) -> None:
+    entry = add_entry(hass, {CONF_STATUS: {"D03102": 1}})
+    client = fake_client()
+    with (
+        patch("custom_components.philips_airpurifier_coap.CoAPClient.create", AsyncMock(return_value=client)),
+        patch(
+            "custom_components.philips_airpurifier_coap.async_get_mac_address_from_host",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock(side_effect=RuntimeError)),
+        pytest.raises(RuntimeError),
+    ):
+        await async_setup_entry(hass, entry)
+    client.shutdown.assert_awaited_once()
+    assert entry.entry_id not in hass.data[DOMAIN]
+
+
+async def test_dhcp_discovery_of_a_configured_host_does_not_ask_the_device(hass: HomeAssistant) -> None:
+    """Its status request would replace the integration's observation."""
+    add_entry(hass, {CONF_STATUS: {"D03102": 1}})
+    flow = PhilipsAirPurifierConfigFlow()
+    flow.hass = hass
+    flow.context = {"source": "dhcp"}  # type: ignore[assignment]
+    with (
+        patch("custom_components.philips_airpurifier_coap.config_flow.CoAPClient.create", AsyncMock()) as create,
+        pytest.raises(AbortFlow, match="already_configured"),
+    ):
+        await flow.async_step_dhcp(DhcpServiceInfo(ip=HOST, hostname="mxchip-1", macaddress="849dc2000000"))
+    create.assert_not_called()

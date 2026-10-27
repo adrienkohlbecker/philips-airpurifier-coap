@@ -185,7 +185,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = config_entry_data
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await coordinator.shutdown()
+        hass.data[DOMAIN].pop(entry.entry_id)
+        raise
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 

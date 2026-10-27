@@ -83,7 +83,11 @@ class Coordinator:
         self._closed = False
         self._command_lock = asyncio.Lock()
         self._last_notified = hass.loop.time()
-        self._liveness_task: Task | None = asyncio.create_task(self._liveness())
+        # Set once the device notified this run, so self.status is live.
+        self._notified = False
+        self._liveness_task: Task | None = hass.async_create_background_task(
+            self._liveness(), f"philips_airpurifier_coap liveness {host}"
+        )
 
     async def shutdown(self):
         """Shutdown the API connection."""
@@ -102,6 +106,11 @@ class Coordinator:
 
         if self.client is not None:
             await self.client.shutdown()
+
+        # Replaces a pending delayed save, which would otherwise land after a
+        # reload read the file, or recreate it after the entry was removed.
+        if self._store is not None and self._notified:
+            await self._store.async_save(self.status)
 
     async def reconnect(self):
         """Reconnect to the API connection, replacing a reconnect in progress."""
@@ -122,28 +131,33 @@ class Coordinator:
         """Ping the device every PING_INTERVAL, and keep its observation going.
 
         A device missing PING_MISSES pings in a row turns unreachable; one
-        answering again reconnects, since it may have restarted and lost its
-        key and observation. While reachable, an observation that ended is
-        reconnected, and one silent for OBSERVE_REFRESH registered again. A
-        command in flight is left alone: it proves the connection itself and
-        reconnects when it fails.
+        answering again reconnects at once, since it may have restarted and
+        lost its key and observation, failing a command in flight. While
+        reachable, an observation that ended is reconnected, and one silent
+        for OBSERVE_REFRESH registered again, unless a command is in flight:
+        it proves the connection itself and reconnects when it fails.
         """
         misses = 0
         while True:
             await asyncio.sleep(PING_INTERVAL)
-            if await self.client.ping():
-                misses = 0
-                if not self.reachable:
-                    _LOGGER.info("%s answers again, reconnecting", self.host)
-                    self._set_reachable(True)
-                    await self._reconnect_unless_running()
-                elif not self._command_lock.locked():
-                    await self._keep_observing()
-                continue
-            misses += 1
-            if misses == PING_MISSES:
-                _LOGGER.warning("%s missed %d pings, marking it unavailable", self.host, misses)
-                self._set_reachable(False)
+            try:
+                if await self.client.ping():
+                    misses = 0
+                    if not self.reachable:
+                        _LOGGER.info("%s answers again, reconnecting", self.host)
+                        self._set_reachable(True)
+                        await self._reconnect_unless_running()
+                    elif not self._command_lock.locked():
+                        await self._keep_observing()
+                    continue
+                misses += 1
+                if misses == PING_MISSES:
+                    _LOGGER.warning("%s missed %d pings, marking it unavailable", self.host, misses)
+                    self._set_reachable(False)
+            except Exception:
+                # The loop must outlive any one check, or the device would never
+                # turn unavailable or be observed again.
+                _LOGGER.exception("Checking %s failed", self.host)
 
     async def _keep_observing(self) -> None:
         """Reconnect an observation that ended, renew one silent for too long."""
@@ -184,6 +198,8 @@ class Coordinator:
             with contextlib.suppress(Exception):
                 await self.client.shutdown()
             self.client = await CoAPClient.create(self.host)
+            if self._notified and self.status is not None:
+                self.client.remember_status(self.status)
             if self._closed:
                 await self.client.shutdown()
                 return
@@ -249,6 +265,7 @@ class Coordinator:
         try:
             async for status in self.client.observe_status():
                 self.status = status
+                self._notified = True
                 self._last_notified = self.hass.loop.time()
                 if self._store is not None:
                     self._store.async_delay_save(lambda: self.status, STATUS_SAVE_DELAY)

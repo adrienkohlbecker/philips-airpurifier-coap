@@ -64,6 +64,9 @@ class PhilipsAirPurifierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug("async_step_dhcp: called, found: %s", discovery_info)
 
         self._host = discovery_info.ip
+        # Asking a configured device for its status would register an observer
+        # from this address, which replaces the integration's own.
+        self._async_abort_entries_match({CONF_HOST: self._host})
         _LOGGER.debug("trying to configure host: %s", self._host)
 
         # let's try and connect to an AirPurifier
