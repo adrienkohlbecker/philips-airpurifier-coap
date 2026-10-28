@@ -21,9 +21,11 @@ _LOGGER = logging.getLogger(__name__)
 # save misses the odd ping, so it counts as gone after PING_MISSES in a row.
 PING_INTERVAL = 30
 PING_MISSES = 3
-# A notification-less observation is registered again after this many seconds,
-# in case its registration got lost; the device keeps one per address, so the
-# renewal replaces it.
+# A notification-less observation is reconnected after this many seconds, in
+# case its registration got lost. A full reconnect, sync included: a device that
+# restarted within PING_MISSES pings lost its key, and ignores a registration
+# made with the old one. The device keeps one observer per address, so the new
+# registration replaces the old one.
 OBSERVE_REFRESH = 900
 # How long a notified status waits before it is saved, batching bursts.
 STATUS_SAVE_DELAY = 60
@@ -133,8 +135,8 @@ class Coordinator:
         A device missing PING_MISSES pings in a row turns unreachable; one
         answering again reconnects at once, since it may have restarted and
         lost its key and observation, failing a command in flight. While
-        reachable, an observation that ended is reconnected, and one silent
-        for OBSERVE_REFRESH registered again, unless a command is in flight:
+        reachable, an observation that ended or stayed silent for
+        OBSERVE_REFRESH is reconnected, unless a command is in flight:
         it proves the connection itself and reconnects when it fails.
         """
         misses = 0
@@ -160,14 +162,14 @@ class Coordinator:
                 _LOGGER.exception("Checking %s failed", self.host)
 
     async def _keep_observing(self) -> None:
-        """Reconnect an observation that ended, renew one silent for too long."""
+        """Reconnect an observation that ended or stayed silent for too long."""
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         if self._task is None or self._task.done():
             await self.reconnect()
         elif self.hass.loop.time() - self._last_notified > OBSERVE_REFRESH:
-            _LOGGER.debug("no notification from %s for %ss, observing again", self.host, OBSERVE_REFRESH)
-            self._start_observing()
+            _LOGGER.debug("no notification from %s for %ss, reconnecting", self.host, OBSERVE_REFRESH)
+            await self.reconnect()
 
     def _set_reachable(self, reachable: bool) -> None:
         self.reachable = reachable

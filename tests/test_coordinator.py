@@ -147,17 +147,21 @@ async def test_liveness_reconnects_an_ended_observation(coordinator: Coordinator
     reconnect.assert_awaited_once()
 
 
-async def test_liveness_renews_a_silent_observation_on_the_same_client(coordinator: Coordinator) -> None:
+async def test_liveness_reconnects_a_silent_observation(coordinator: Coordinator) -> None:
+    """With a new key: a device that restarted unnoticed ignores the old one."""
     coordinator._start_observing()
-    observing = coordinator._task
+    old_client = coordinator.client
+    new_client = fake_client()
     coordinator._last_notified -= coordinator_module.OBSERVE_REFRESH + 1
-    with patch.object(coordinator, "reconnect", AsyncMock()) as reconnect:
+    with patch(CREATE, AsyncMock(return_value=new_client)) as create:
         await coordinator._keep_observing()
-    reconnect.assert_not_called()
-    assert coordinator._task is not observing
-    await asyncio.sleep(0)
-    assert observing is not None
-    assert observing.cancelled()
+        assert coordinator._reconnect_task is not None
+        await coordinator._reconnect_task
+    create.assert_awaited_once_with(HOST)
+    old_client.shutdown.assert_awaited_once()
+    assert coordinator.client is new_client
+    assert coordinator._task is not None
+    assert not coordinator._task.done()
 
 
 async def test_liveness_leaves_a_quiet_observation_alone(coordinator: Coordinator) -> None:
